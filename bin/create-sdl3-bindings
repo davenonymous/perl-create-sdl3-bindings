@@ -1,0 +1,135 @@
+#!/usr/bin/env perl
+# Copyright 2026 davenonymous
+use v5.36;
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+
+use Getopt::Pad;
+use Path::Tiny qw(path);
+use BindGen::Naming;
+use BindGen::Filter;
+use BindGen::Generator;
+use BindGen::Emitter;
+
+our $VERSION = '0.001';
+
+my $projectRoot = path($FindBin::Bin)->parent;
+
+my $opt = GetOptions(
+	description => 'Generate a low-level Perl XS binding for a C library (SDL3 by default) from its public headers, using clang.',
+	options     => {
+		'source|s'       => {type => 'dir', mustExist => 1, default => $projectRoot->child('vendor/SDL/include')->stringify, help => 'Include root containing the public headers', group => 'Input'},
+		'entry-header|e' => {type => 's',   default   => 'SDL3/SDL.h', help => 'Umbrella header, relative to the include root',                 group => 'Input'},
+		'clang'          => {type => 's',   default   => 'clang',      help => 'clang binary to run',                                           group => 'Input'},
+		'clang-arg'      => {type => 's',   multiple  => 1,            help => 'Extra argument passed to clang, e.g. -DSOMETHING',              group => 'Input'},
+		'namespace|n'    => {type => 's',   default   => 'SDL3',       help => 'Root Perl namespace of the generated binding',                  group => 'Naming'},
+		'api-namespace'  => {type => 's',   default   => 'API',        help => 'Sub-namespace holding one function module per header',          group => 'Naming'},
+		'strip-prefix'   => {type => 's',   default   => 'SDL_',       help => 'Symbol prefix removed from C names when forming package names', group => 'Naming'},
+		'free-function'  =>
+		  {type => 's', default => 'SDL_free', help => 'Deallocator for char * results the caller owns (recognised through the doc comment naming it); empty disables freeing', group => 'Naming'},
+		'include-header' => {type => 's', multiple => 1, help => 'Only bind headers whose basename matches this regex (repeatable)', group => 'Selection'},
+		'exclude-header' => {
+			type     => 's',
+			multiple => 1,
+			default  => [ '^SDL_test', '^SDL_main', '^SDL_stdinc\.h$', '^SDL_oldnames', '^SDL_(opengl|opengles|egl|openxr)', '^SDL_(begin|close)_code', '^SDL_intrin' ],
+			help     => 'Skip headers whose basename matches this regex (repeatable)',
+			group    => 'Selection'
+		},
+		'exclude-function' => {type => 's',       multiple => 1, help => 'Skip functions whose name matches this regex (repeatable)',                            group => 'Selection'},
+		'include-variadic' => {type => 'bool',    default  => 1, help => 'Bind printf-like variadic functions as fixed arguments plus one preformatted message', group => 'Selection'},
+		'include-inline'   => {type => 'bool',    default  => 1, help => 'Bind static inline functions defined in the headers',                                  group => 'Selection'},
+		'verbose|v'        => {type => 'counter', help     => 'Report progress on STDERR'},
+	},
+	commands => {
+		generate => {
+			description => 'Write the binding distribution',
+			options     => {
+				'output|o'     => {type => 'dir', required => 1,       createPathIfMissing => 1, help => 'Directory receiving the distribution'},
+				'dist-version' => {type => 's',   default  => '0.001', help => 'Version of the generated distribution'},
+				'pkg-config'   => {type => 's',   default  => 'sdl3',  help => 'pkg-config package the generated Makefile.PL queries for flags'},
+				'force|f'      => {help => 'Write into a non-empty output directory'},
+			},
+		},
+		inspect => {
+			description => 'Analyse the headers and show what would be bound and what would be skipped',
+			options     => {
+				'details' => {help => 'List every skipped declaration with its reason'},
+			},
+		},
+	},
+	examples => [
+		{text => 'Generate the SDL3 binding from the bundled submodule', args => 'generate --output ../perl-sdl3'},
+		{text => 'See which declarations would be skipped and why',      args => 'inspect --details'},
+		{text => 'Bind only the video and render headers',               args => '--include-header video --include-header render inspect'},
+	],
+);
+
+my $naming = BindGen::Naming->new(namespace => $opt->namespace, apiNamespace => $opt->apiNamespace, stripPrefix => $opt->stripPrefix);
+my $filter = BindGen::Filter->new(
+	includeHeaders   => $opt->includeHeader,
+	excludeHeaders   => $opt->excludeHeader,
+	excludeFunctions => $opt->excludeFunction,
+	includeVariadic  => $opt->includeVariadic,
+	includeInline    => $opt->includeInline,
+);
+my $generator = BindGen::Generator->new(
+	clangBinary  => $opt->clang,
+	clangArgs    => $opt->clangArg,
+	includeRoot  => $opt->source,
+	entryHeader  => $opt->entryHeader,
+	naming       => $naming,
+	filter       => $filter,
+	freeFunction => ($opt->freeFunction eq '' ? undef                                                           : $opt->freeFunction),
+	logger       => ($opt->verbose            ? sub ($message) { say STDERR "[create-sdl3-bindings] $message" } : sub { }),
+);
+
+my $plan = $generator->buildPlan;
+
+if ($opt->command eq 'inspect') {
+	inspect($plan, $opt->subcommand->details);
+}
+else {
+	generate($plan, $opt->subcommand);
+}
+
+sub inspect($plan, $details) {
+	say sprintf('%-40s %-22s %9s %8s %9s', 'Module', 'Header', 'Functions', 'Records', 'Constants');
+	foreach my $headerPlan ($plan->headers->@*) {
+		say sprintf(
+			'%-40s %-22s %9d %8d %9d',
+			$headerPlan->module,
+			$headerPlan->header->name,
+			scalar $headerPlan->functions->@*,
+			scalar(map { $_->withNested } $headerPlan->records->@*),
+			scalar $headerPlan->constants->@*
+		);
+	}
+	say sprintf('%-40s %-22s %9s %8d %9s', '(referenced only)', '-', '-', scalar $plan->foreignRecords->@*, '-') if $plan->foreignRecords->@*;
+	say sprintf('%d callback trampolines', scalar $plan->callbacks->@*);
+	say '';
+	say for $plan->report->summaryLines;
+	return if !$details;
+	say '';
+	say for $plan->report->detailLines;
+	say '';
+	say for $plan->report->noteLines;
+	return;
+}
+
+sub generate($plan, $options) {
+	my $output = path($options->output);
+	die "output directory $output is not empty, use --force to write into it anyway\n" if !$options->force && $output->children;
+	my $written = BindGen::Emitter->new(
+		plan          => $plan,
+		naming        => $naming,
+		outputDir     => "$output",
+		templateDir   => $projectRoot->child('templates')->stringify,
+		distVersion   => $options->distVersion,
+		pkgConfigName => $options->pkgConfig,
+		entryHeader   => $opt->entryHeader,
+	)->emit;
+	say sprintf('wrote %d files to %s', scalar @$written, $output);
+	say for $plan->report->summaryLines;
+	say "details: $output/bindgen-report.txt";
+	return;
+}

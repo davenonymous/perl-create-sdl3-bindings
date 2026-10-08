@@ -1,0 +1,27 @@
+# [% root %]
+
+Low-level Perl XS binding generated from the C headers by
+`create-sdl3-bindings`. Do not edit the generated files; regenerate them.
+
+## Building
+
+    perl Makefile.PL   # needs `pkg-config --cflags --libs [% pkgConfig %]` to work
+    make
+    make test
+    make install
+
+## Layout
+
+| Module | Header | Functions | Constants |
+|--------|--------|----------:|----------:|
+[% FOREACH h IN headers %]| `[% h.module %]` | `[% h.header %]` | [% h.functions %] | [% h.constants %] |
+[% END %]
+
+Struct and union classes live directly below `[% root %]::`, see
+`[% structBase %]` for the object model and `[% pointerClass %]` for untyped
+memory. `bindgen-report.txt` lists every declaration that was left out and why.
+
+## Conventions
+
+See `perldoc [% root %]` for how strings, structs, out parameters,
+callbacks and variadic functions are mapped.

@@ -1,0 +1,16 @@
+use Test2::V0;
+use [% root %];
+
+[% IF sample %]
+my $object = [% sample.class %]->new([% sample.field %] => 42);
+isa_ok($object, '[% sample.class %]', '[% structBase %]');
+is($object->[% sample.field %], 42, 'field set through the constructor');
+is($object->[% sample.field %](7)->[% sample.field %], 7, 'setter chains and stores');
+is(length($object->bytes), $object->sizeof, 'bytes match sizeof');
+ok($object->address > 0, 'owned memory has an address');
+like(dies { [% sample.class %]->new(no_such_field => 1) }, qr/no field/, 'unknown field fails loudly');
+[% ELSE %]
+pass('no struct with an integer field to exercise');
+[% END %]
+
+done_testing;

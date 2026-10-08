@@ -1,0 +1,12 @@
+use Test2::V0;
+use [% root %] ':all';
+
+my @missing = grep { !defined &{"[% root %]::$_"} } @[% root %]::EXPORT_OK;
+is(\@missing, [], 'every exported symbol is defined');
+ok(scalar @[% root %]::EXPORT_OK > 0, 'something is exported');
+
+my $null = [% pointerClass %]->new(0);
+ok($null->is_null, 'null pointer object');
+is($null->address, 0, 'address of null pointer');
+
+done_testing;
