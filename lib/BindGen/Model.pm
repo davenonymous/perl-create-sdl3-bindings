@@ -21,7 +21,7 @@ class BindGen::Model {
 	method functions() { return [@functions] }
 	method records()   { return [ values %records ] }
 	method enums()     { return [ values %enums ] }
-	method macros()    { return [ values %macros ] }
+	method macros()    { return [ sort { $a->name cmp $b->name } values %macros ] }
 	method callbacks() { return {%callbacks} }
 
 	method header($path)   { return $headers{$path} }
