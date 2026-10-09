@@ -36,6 +36,26 @@ Building SDL3 from the submodule for local testing:
     ninja -C .build/sdl3 install
     export PKG_CONFIG_PATH=$PWD/.build/prefix/lib/pkgconfig LD_LIBRARY_PATH=$PWD/.build/prefix/lib
 
+## Automatic releases
+
+The workflow `.github/workflows/sdl3-release.yml` publishes the binding for
+every SDL 3 release to
+[davenonymous/perl-sdl3-xs](https://github.com/davenonymous/perl-sdl3-xs).
+libsdl-org/SDL cannot trigger it, so it polls the upstream `release-3.X.Y`
+tags once a day and publishes every release newer than the last published
+one (only the newest when nothing is published yet). It can also be started
+by hand with a specific SDL tag.
+
+For each release it builds SDL from that tag, generates the binding,
+runs `make disttest` on it and then replaces the content of the target
+repository's main branch with the generated distribution, tags it and
+creates a GitHub release with the `make dist` tarball attached. SDL
+`release-3.4.18` becomes version `3.004018`, tagged `v3.004018`.
+
+The workflow needs the repository secret `SDL3_XS_TOKEN`: a fine-grained
+personal access token for the target repository with "Contents: read and
+write".
+
 ## How it works
 
 1. `BindGen::Clang` runs clang three times on the umbrella header: a JSON

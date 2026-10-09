@@ -1,0 +1,187 @@
+# Generates the Perl binding for every new SDL 3 release of libsdl-org/SDL,
+# builds and tests it against that release and publishes it to
+# davenonymous/perl-sdl3-xs (commit on main, tag and GitHub release).
+#
+# Upstream cannot trigger this repository, so a daily schedule polls its tags.
+# Needs the secret SDL3_XS_TOKEN: a fine-grained token with "Contents: read
+# and write" on the target repository.
+name: SDL3 release
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      sdl-tag:
+        description: 'SDL tag to publish (release-3.X.Y); empty publishes every release newer than the last published one'
+        required: false
+        default: ''
+
+concurrency:
+  group: sdl3-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: libsdl-org/SDL
+  TARGET_REPO: davenonymous/perl-sdl3-xs
+
+jobs:
+  detect:
+    name: Find unpublished SDL releases
+    runs-on: ubuntu-24.04
+    outputs:
+      tags: ${{ steps.pending.outputs.tags }}
+    steps:
+      # Target tags are v<major>.<minor:03d><patch:03d>, so v3.004018 stands for release-3.4.18.
+      # Without any published tag only the newest upstream release is published.
+      - name: Compare upstream releases with published versions
+        id: pending
+        env:
+          REQUESTED_TAG: ${{ inputs.sdl-tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED_TAG" ]; then
+            if ! [[ "$REQUESTED_TAG" =~ ^release-3\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::'$REQUESTED_TAG' is not an SDL 3 release tag (release-3.X.Y)"
+              exit 1
+            fi
+            echo "tags=$(jq -cn --arg tag "$REQUESTED_TAG" '[$tag]')" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          upstream=$(git ls-remote --tags --refs "https://github.com/$UPSTREAM_REPO" \
+            | sed -n -E 's#^.*refs/tags/release-(3\.[0-9]+\.[0-9]+)$#\1#p' | sort -V)
+          published=$(git ls-remote --tags --refs "https://github.com/$TARGET_REPO" \
+            | sed -n -E 's#^.*refs/tags/v([0-9]+)\.([0-9]{3})([0-9]{3})$#\1 \2 \3#p' \
+            | awk '{ print $1 + 0 "." $2 + 0 "." $3 + 0 }' | sort -V | tail -n 1)
+          if [ -z "$upstream" ]; then
+            echo "::error::no release-3.X.Y tags found in $UPSTREAM_REPO"
+            exit 1
+          fi
+
+          pending=()
+          if [ -z "$published" ]; then
+            pending+=("release-$(tail -n 1 <<< "$upstream")")
+          else
+            while read -r version; do
+              if [ "$version" = "$published" ]; then
+                continue
+              fi
+              newer=$(printf '%s\n%s\n' "$published" "$version" | sort -V | tail -n 1)
+              if [ "$newer" = "$version" ]; then
+                pending+=("release-$version")
+              fi
+            done <<< "$upstream"
+          fi
+
+          echo "last published: ${published:-none}, pending: ${pending[*]:-none}"
+          if [ ${#pending[@]} -eq 0 ]; then
+            echo 'tags=[]' >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=$(printf '%s\n' "${pending[@]}" | jq -R . | jq -cs .)" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    name: Publish ${{ matrix.tag }}
+    needs: detect
+    if: needs.detect.outputs.tags != '[]'
+    runs-on: ubuntu-24.04
+    strategy:
+      # One at a time and oldest first, so main and the tags follow the upstream order.
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.detect.outputs.tags) }}
+    env:
+      SDL_TAG: ${{ matrix.tag }}
+    steps:
+      - name: Derive the distribution version
+        run: |
+          set -euo pipefail
+          if ! [[ "$SDL_TAG" =~ ^release-([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::'$SDL_TAG' is not a release tag"
+            exit 1
+          fi
+          major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]} patch=${BASH_REMATCH[3]}
+          if [ "$minor" -gt 999 ] || [ "$patch" -gt 999 ]; then
+            echo "::error::$SDL_TAG does not fit the version scheme <major>.<minor:03d><patch:03d>"
+            exit 1
+          fi
+          printf 'DIST_VERSION=%d.%03d%03d\n' "$major" "$minor" "$patch" >> "$GITHUB_ENV"
+
+      - name: Check out the generator
+        uses: actions/checkout@v7
+        with:
+          path: generator
+
+      - name: Check out SDL ${{ matrix.tag }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ matrix.tag }}
+          path: sdl
+
+      - name: Set up Perl with the generator's dependencies
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.40'
+          working-directory: generator
+          install-modules-with: cpanm
+          install-modules-args: --notest
+          install-modules: |
+            ExtUtils::PkgConfig
+            Test2::V0
+
+      # Headless build: the runner has no X11 or Wayland libraries, and the binding's tests open no windows.
+      - name: Build and install SDL
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/sdl-prefix"
+          cmake -S sdl -B sdl-build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_UNIX_CONSOLE_BUILD=ON
+          ninja -C sdl-build install
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$prefix/lib" >> "$GITHUB_ENV"
+
+      - name: Generate the binding
+        run: generator/bin/create-sdl3-bindings --clang clang-17 --source sdl/include generate --dist-version "$DIST_VERSION" --output dist
+
+      # disttest builds and tests the distribution from its MANIFEST, so the tarball is proven complete.
+      - name: Build, test and package the distribution
+        run: |
+          set -euo pipefail
+          cp -a dist package
+          cd package
+          perl Makefile.PL
+          make manifest
+          make disttest
+          make dist
+          test -f "SDL3-$DIST_VERSION.tar.gz"
+
+      - name: Check out the target repository
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          token: ${{ secrets.SDL3_XS_TOKEN }}
+          path: target
+
+      - name: Commit, tag and release
+        env:
+          GH_TOKEN: ${{ secrets.SDL3_XS_TOKEN }}
+        run: |
+          set -euo pipefail
+          source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA"
+          rsync -a --delete --exclude .git dist/ target/
+          cd target
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m "SDL3 $DIST_VERSION for SDL $SDL_TAG" -m "Generated from $UPSTREAM_REPO $SDL_TAG by $source"
+          git tag -a "v$DIST_VERSION" -m "SDL3 $DIST_VERSION for SDL $SDL_TAG"
+          git push origin HEAD "v$DIST_VERSION"
+          gh release create "v$DIST_VERSION" "../package/SDL3-$DIST_VERSION.tar.gz" \
+            --repo "$TARGET_REPO" \
+            --title "SDL3 $DIST_VERSION" \
+            --notes "Perl binding for SDL $SDL_TAG (https://github.com/$UPSTREAM_REPO/releases/tag/$SDL_TAG), generated by $source."
